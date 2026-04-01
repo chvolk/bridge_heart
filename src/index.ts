@@ -10,20 +10,86 @@ const model = process.argv[2] || LARGE_MODEL;
 // ── Terminal helpers ──────────────────────────────────────────────────
 const write = (s: string) => process.stdout.write(s);
 
+// ── Layout ───────────────────────────────────────────────────────────
+//
+// Normal scrolling terminal. The bottom two visible lines are:
+//
+//   [spinner line]   ← only present when spinner is active
+//   ❯ user input     ← always the very last line
+//
+// Before writing output we erase those bottom lines, write the output,
+// then redraw them. This keeps the prompt right below the output and
+// allows typing at all times.
+
+const PROMPT = "\x1b[38;5;75m❯\x1b[0m "; // fixed-color ❯
+
+let spinnerShown = false;
+
 // ── Readline ─────────────────────────────────────────────────────────
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: true,
+});
+
+// Suppress readline's own rendering — we draw the prompt ourselves.
+(rl as any).output = null;
+
+// Redraw prompt on every keypress so typed characters appear immediately.
+process.stdin.on("data", () => {
+  setImmediate(() => drawPrompt());
+});
+
+function drawPrompt(): void {
+  const line: string = (rl as any).line ?? "";
+  const cursor: number = (rl as any).cursor ?? 0;
+  write("\r\x1b[2K" + PROMPT + line);
+  const back = line.length - cursor;
+  if (back > 0) write(`\x1b[${back}D`);
+}
+
+// ── Bottom-line management ───────────────────────────────────────────
+//
+// eraseBottom / redrawBottom are called around every write to the output
+// area so that the spinner + prompt never get mixed into scrollback.
+
+function eraseBottom(): void {
+  // We're on the prompt line. Clear it.
+  write("\r\x1b[2K");
+  if (spinnerShown) {
+    // Move up to spinner line, clear it, come back down.
+    write("\x1b[A\r\x1b[2K");
+    // Cursor is now on the (cleared) spinner line.
+    // Don't move down — the next write will start here, which is correct
+    // because we're about to write output that replaces this line.
+  }
+}
+
+function redrawBottom(): void {
+  // After output was written the cursor is at the end of output.
+  // Draw spinner (if active) then prompt, each on its own line.
+  if (spinnerShown) {
+    write("\n" + buildSpinnerText());
+  }
+  write("\n");
+  drawPrompt();
+}
+
+/** Write text into the output area (above spinner + prompt). */
+function outputWrite(s: string): void {
+  eraseBottom();
+  write(s);
+  redrawBottom();
+}
+
+/** Write a complete line into the output area. */
+function outputLine(s: string): void {
+  eraseBottom();
+  write(s + "\n");
+  redrawBottom();
+}
 
 // ── Spinner ──────────────────────────────────────────────────────────
-//
-// Layout when spinner is active:
-//
-//   ... scrollable output ...
-//   "  ⠙ Thinking..."          ← spinner line
-//   "❯ user typing here"       ← prompt line (readline manages cursor here)
-//
-// renderSpinnerFrame uses save/restore cursor (\x1b7 / \x1b8) so
-// readline's cursor position on the prompt line is never disturbed.
-// The user can type freely while the spinner animates.
 
 const THINK_FRAMES  = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WORK_FRAMES   = ["·∙∙∙", "∙·∙∙", "∙∙·∙", "∙∙∙·", "∙∙·∙", "∙·∙∙"];
@@ -38,11 +104,10 @@ let spinnerInterval: ReturnType<typeof setInterval> | null = null;
 let spinnerFrame = 0;
 let spinnerLabel = "";
 let spinnerMode: SpinnerMode = "thinking";
-let spinnerActive = false;
 
 const pickVerb = () => THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)];
 
-function buildSpinnerLine(): string {
+function buildSpinnerText(): string {
   if (spinnerMode === "thinking") {
     return chalk.cyan(`  ${THINK_FRAMES[spinnerFrame % THINK_FRAMES.length]} `) +
            chalk.gray(spinnerLabel);
@@ -55,77 +120,88 @@ function buildSpinnerLine(): string {
   }
 }
 
-// Update spinner in place. DEC save/restore (\x1b7/\x1b8) keeps
-// readline's cursor exactly where it was on the prompt line.
-function renderSpinnerFrame(): void {
-  write(
-    "\x1b7" +              // DEC save cursor
-    "\x1b[A" +             // up to spinner line
-    "\x1b[2K\r" +          // clear line, go to col 0
-    buildSpinnerLine() +
-    "\x1b8"                // DEC restore cursor
-  );
-}
-
-function redrawPrompt(): void {
-  const line = (rl as any).line as string || "";
-  const cursor = (rl as any).cursor as number || 0;
-  write("\r\x1b[2K" + chalk.cyan("❯ ") + line);
-  // Move cursor to correct position (readline's cursor may not be at end)
-  const diff = line.length - cursor;
-  if (diff > 0) write(`\x1b[${diff}D`);
+/** Animate the spinner in-place without touching the output area. */
+function tickSpinner(): void {
+  spinnerFrame++;
+  // Save cursor (on prompt line), go up to spinner line, redraw it, restore.
+  write("\x1b7");
+  write("\x1b[A\r\x1b[2K" + buildSpinnerText());
+  write("\x1b8");
 }
 
 function startSpinner(mode: SpinnerMode, label: string): void {
   if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
   spinnerMode = mode; spinnerLabel = label; spinnerFrame = 0;
-  write("\x1b[?25l");       // hide hardware cursor
 
-  if (spinnerActive) {
-    // Transition: update spinner line in place
-    write(
-      "\x1b7" +
-      "\x1b[A\x1b[2K\r" + buildSpinnerLine() +
-      "\x1b8"
-    );
-  } else {
-    spinnerActive = true;
-    // Insert spinner line above prompt:
-    // 1. Clear current line (prompt), write spinner, newline, then re-draw prompt
+  if (!spinnerShown) {
+    spinnerShown = true;
+    // Insert spinner line between output and prompt:
+    // clear prompt, write spinner + newline, redraw prompt.
     write("\r\x1b[2K");
-    write(buildSpinnerLine() + "\n");
-    redrawPrompt();
+    write(buildSpinnerText() + "\n");
+    drawPrompt();
+  } else {
+    // Already showing — just update the spinner line in place.
+    write("\x1b7");
+    write("\x1b[A\r\x1b[2K" + buildSpinnerText());
+    write("\x1b8");
   }
 
-  spinnerInterval = setInterval(() => { spinnerFrame++; renderSpinnerFrame(); }, 120);
+  spinnerInterval = setInterval(tickSpinner, 120);
 }
 
 function stopSpinner(): void {
   if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
-  write("\x1b[?25h");       // show hardware cursor
-  if (!spinnerActive) return;
-  spinnerActive = false;
+  if (!spinnerShown) return;
+  spinnerShown = false;
 
-  // Remove spinner line:
-  // 1. Go up to spinner line, clear it, delete it (shifts prompt up)
-  // 2. Redraw prompt on its new (shifted-up) position
-  write(
-    "\x1b[A" +             // up to spinner line
-    "\x1b[2K" +            // clear it
-    "\x1b[M"               // delete line — scrolls everything below up
-  );
-  // Cursor is now on the line that was below spinner (the prompt line,
-  // which shifted up to replace the spinner line). Redraw it clean.
-  redrawPrompt();
+  // Remove the spinner line: go up from prompt, clear, delete line,
+  // then redraw prompt (which shifted up by one).
+  write("\x1b[A\r\x1b[2K\x1b[M");
+  drawPrompt();
 }
-
-process.on("exit", () => write("\x1b[?25h"));
 
 // ── State ────────────────────────────────────────────────────────────
 let isProcessing = false;
 let currentAbort: AbortController | null = null;
 let pendingInterrupt: string | null = null;
 let streamingActive = false;
+// When streaming text, we write directly (no erase/redraw cycle) for
+// smooth character-by-character output. This flag tracks whether the
+// cursor is "in the output area" (above the bottom lines).
+let streamCursorInOutput = false;
+
+// ── Streaming helpers ────────────────────────────────────────────────
+//
+// During text streaming we don't want the erase/redraw overhead on every
+// character. Instead we temporarily remove the bottom lines, stream
+// directly, and put them back when streaming ends or is interrupted.
+
+function streamStart(): void {
+  streamingActive = true;
+  // Erase bottom lines so we can write output directly.
+  eraseBottom();
+  streamCursorInOutput = true;
+}
+
+function streamEnd(): void {
+  if (!streamingActive) return;
+  streamingActive = false;
+  if (streamCursorInOutput) {
+    // We were writing directly — put bottom lines back.
+    redrawBottom();
+    streamCursorInOutput = false;
+  }
+}
+
+/** Write a chunk during streaming (fast path, no erase/redraw). */
+function streamWrite(s: string): void {
+  if (!streamCursorInOutput) {
+    eraseBottom();
+    streamCursorInOutput = true;
+  }
+  write(s);
+}
 
 // ── Logo ─────────────────────────────────────────────────────────────
 const C = chalk.cyan, W = chalk.bold.white, G = chalk.gray;
@@ -150,31 +226,33 @@ const logo = [
   chalk.gray("  Type your message and press Enter. Ctrl+C to quit."),
 ].join("\n");
 
+// ── Boot ─────────────────────────────────────────────────────────────
 process.stdout.write("\x1b]0;Bridge Computer\x07");
 console.log(logo);
+write("\n");
+drawPrompt();
 
-function showPrompt(): void {
-  write("\n" + chalk.cyan("❯ "));
-}
+process.on("exit", () => write("\x1b[?25h\n"));
 
 // ── Input ────────────────────────────────────────────────────────────
 rl.on("line", (rawInput: string) => {
-  // readline emits 'line' after echoing \n, so cursor is one line below prompt.
-  // If spinner was active, clean it up (spinner line + prompt line + \n = cursor 2 below spinner).
-  if (spinnerActive) {
+  // readline already printed a newline. If spinner was showing, we now
+  // have: output / spinner / (old prompt — now blank) / cursor.
+  // Clean up: go back and remove the spinner line if present.
+  if (spinnerShown) {
     if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
-    write("\x1b[?25h");
-    spinnerActive = false;
-    // Go up 2 to spinner line, delete it
+    spinnerShown = false;
+    // Cursor is one line below old prompt (readline's \n).
+    // Go up 2 (past blank prompt line, to spinner), clear + delete it.
     write("\x1b[2A\x1b[2K\x1b[M");
-    // Now on the prompt line (shifted up). Go down past it to where \n left us.
+    // Now on old prompt line (shifted up). Go down 1 to where \n left us.
     write("\x1b[B");
   }
 
   const input = rawInput.trim();
 
   if (!input) {
-    if (!isProcessing) showPrompt();
+    drawPrompt();
     return;
   }
 
@@ -186,13 +264,12 @@ rl.on("line", (rawInput: string) => {
   if (isProcessing) {
     pendingInterrupt = input;
     currentAbort?.abort();
-    write(chalk.dim("\n  ↩ Added to task — restarting...\n"));
+    write(chalk.dim("  ↩ Added to task — restarting...\n"));
+    drawPrompt();
   } else {
     void handleInput(input);
   }
 });
-
-showPrompt();
 
 // ── Agent loop ───────────────────────────────────────────────────────
 async function handleInput(userMessage: string): Promise<void> {
@@ -204,14 +281,13 @@ async function handleInput(userMessage: string): Promise<void> {
   let partialAssistantText = "";
   let completedMessage: AssistantMessage | null = null;
 
-  write("\n");
   startSpinner("thinking", pickVerb() + "...");
 
   try {
     for await (const event of agentLoop(userMessage, history, model, signal)) {
       switch (event.type) {
         case "thinking_start":
-          if (streamingActive) { streamingActive = false; write("\n"); }
+          streamEnd();
           startSpinner("reasoning", "Reasoning...");
           break;
 
@@ -220,8 +296,8 @@ async function handleInput(userMessage: string): Promise<void> {
           break;
 
         case "tool_building":
-          if (streamingActive) { streamingActive = false; write("\n"); }
-          if (!spinnerActive) {
+          streamEnd();
+          if (!spinnerInterval) {
             startSpinner("thinking", pickVerb() + "...");
           }
           break;
@@ -230,60 +306,59 @@ async function handleInput(userMessage: string): Promise<void> {
           if (!receivedFirstToken) {
             receivedFirstToken = true;
             stopSpinner();
-            // Clear prompt line to start streaming text there
-            write("\r\x1b[2K");
-            streamingActive = true;
+            streamStart();
           }
           partialAssistantText += event.content;
-          write(event.content);
+          streamWrite(event.content);
           break;
 
         case "tool_start":
-          if (streamingActive) { streamingActive = false; write("\n"); }
+          streamEnd();
           stopSpinner();
           receivedFirstToken = true;
-          write(
+          outputLine(
             chalk.yellow(`  ▶ ${event.name}`) +
-            chalk.gray(`(${truncateArgs(event.args, 80)})`) +
-            "\n",
+            chalk.gray(`(${truncateArgs(event.args, 80)})`),
           );
           startSpinner("working", `${event.name}...`);
           break;
 
         case "tool_result":
           stopSpinner();
-          write(
+          outputLine(
             event.isError
-              ? chalk.red("  ✗ Error: ") + chalk.gray(truncateOutput(event.content, 200)) + "\n"
-              : chalk.green("  ✓ ") + chalk.gray(truncateOutput(event.content, 200)) + "\n",
+              ? chalk.red("  ✗ Error: ") + chalk.gray(truncateOutput(event.content, 200))
+              : chalk.green("  ✓ ") + chalk.gray(truncateOutput(event.content, 200)),
           );
           startSpinner("thinking", pickVerb() + "...");
           receivedFirstToken = false;
           break;
 
         case "turn_complete":
-          if (streamingActive) { streamingActive = false; write("\n"); }
+          streamEnd();
           stopSpinner();
           completedMessage = event.message;
           break;
 
         case "error":
-          if (streamingActive) { streamingActive = false; write("\n"); }
+          streamEnd();
           stopSpinner();
-          if (!signal.aborted) write(chalk.red(`\nError: ${event.message}\n`));
+          if (!signal.aborted) {
+            write(chalk.red(`\nError: ${event.message}\n`));
+          }
           break;
       }
     }
   } catch (err: unknown) {
-    if (streamingActive) { streamingActive = false; write("\n"); }
+    streamEnd();
     stopSpinner();
     if (!signal.aborted) {
       write(chalk.red(`\nFatal: ${err instanceof Error ? err.message : String(err)}\n`));
     }
   }
 
-  if (streamingActive) { streamingActive = false; write("\n"); }
-  stopSpinner(); // safety
+  streamEnd();
+  stopSpinner();
 
   if (signal.aborted && pendingInterrupt) {
     history.push({ role: "user", content: userMessage });
@@ -303,7 +378,8 @@ async function handleInput(userMessage: string): Promise<void> {
 
   isProcessing = false;
   currentAbort = null;
-  showPrompt();
+  write("\n");
+  drawPrompt();
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
