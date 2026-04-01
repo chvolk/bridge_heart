@@ -9,6 +9,8 @@ const model = process.argv[2] || LARGE_MODEL;
 
 // ── Terminal helpers ──────────────────────────────────────────────────
 const write = (s: string) => process.stdout.write(s);
+const hideCursor = () => write("\x1b[?25l");
+const showCursor = () => write("\x1b[?25h");
 
 // ── Layout ───────────────────────────────────────────────────────────
 //
@@ -46,6 +48,7 @@ function drawPrompt(): void {
   write("\r\x1b[2K" + PROMPT + line);
   const back = line.length - cursor;
   if (back > 0) write(`\x1b[${back}D`);
+  showCursor();
 }
 
 // ── Bottom-line management ───────────────────────────────────────────
@@ -54,6 +57,7 @@ function drawPrompt(): void {
 // area so that the spinner + prompt never get mixed into scrollback.
 
 function eraseBottom(): void {
+  hideCursor();
   // We're on the prompt line. Clear it.
   write("\r\x1b[2K");
   if (spinnerShown) {
@@ -123,10 +127,12 @@ function buildSpinnerText(): string {
 /** Animate the spinner in-place without touching the output area. */
 function tickSpinner(): void {
   spinnerFrame++;
+  hideCursor();
   // Save cursor (on prompt line), go up to spinner line, redraw it, restore.
   write("\x1b7");
   write("\x1b[A\r\x1b[2K" + buildSpinnerText());
   write("\x1b8");
+  showCursor();
 }
 
 function startSpinner(mode: SpinnerMode, label: string): void {
@@ -135,6 +141,7 @@ function startSpinner(mode: SpinnerMode, label: string): void {
 
   if (!spinnerShown) {
     spinnerShown = true;
+    hideCursor();
     // Insert spinner line between output and prompt:
     // clear prompt, write spinner + newline, redraw prompt.
     write("\r\x1b[2K");
@@ -142,6 +149,7 @@ function startSpinner(mode: SpinnerMode, label: string): void {
     drawPrompt();
   } else {
     // Already showing — just update the spinner line in place.
+    hideCursor();
     write("\x1b7");
     write("\x1b[A\r\x1b[2K" + buildSpinnerText());
     write("\x1b8");
@@ -155,6 +163,7 @@ function stopSpinner(): void {
   if (!spinnerShown) return;
   spinnerShown = false;
 
+  hideCursor();
   // Remove the spinner line: go up from prompt, clear, delete line,
   // then redraw prompt (which shifted up by one).
   write("\x1b[A\r\x1b[2K\x1b[M");
@@ -166,48 +175,73 @@ let isProcessing = false;
 let currentAbort: AbortController | null = null;
 let pendingInterrupt: string | null = null;
 let streamingActive = false;
-// Tracks whether \x1b7 holds a saved output-cursor position.
-let streamHasSavedPos = false;
+let streamCol = 0;            // 0-based column tracker for output cursor
+let streamPromptDrawn = false; // is there a temp prompt line below output?
+let streamStarted = false;
 
 // ── Streaming helpers ────────────────────────────────────────────────
 //
-// During streaming we keep the prompt visible below the output at all
-// times.  After each chunk we:
-//   1. Save the output cursor position (\x1b7)
-//   2. Draw the prompt on the next line
-// On the next chunk we:
-//   1. Restore to the saved output position (\x1b8)
-//   2. Clear everything below it (\x1b[J) — wipes the temp prompt
-//   3. Write the new chunk, then repeat.
+// During streaming we keep the prompt visible below the output.
+// We track the output column so we can erase the temp prompt and
+// return to the exact output position without DEC save/restore
+// (which breaks when the terminal scrolls).
+//
+// After each chunk:
+//   1. Write the chunk, tracking the column
+//   2. \n + drawPrompt() to show the prompt below
+// Before the next chunk:
+//   1. \x1b[A (up to output line) + \x1b[{col}G (to saved col)
+//   2. \x1b[J (clear from cursor to end of display — wipes temp prompt)
+//   3. Continue writing
 
 function streamStart(): void {
   streamingActive = true;
-  streamHasSavedPos = false;
+  streamCol = 0;
+  streamPromptDrawn = false;
+  streamStarted = false;
 }
 
 function streamEnd(): void {
   if (!streamingActive) return;
   streamingActive = false;
-  streamHasSavedPos = false;
+  streamStarted = false;
+  streamPromptDrawn = false;
   // Prompt is already drawn from the last streamWrite call.
 }
 
 /** Write a chunk during streaming, keeping the prompt visible below. */
 function streamWrite(s: string): void {
-  if (streamHasSavedPos) {
-    // Return to where we left off in the output.
-    write("\x1b8");      // restore output cursor
-    write("\x1b[J");     // clear from here to end of screen (wipes temp prompt)
-  } else {
-    // First chunk — cursor is on the prompt line.
-    write("\r\x1b[2K");  // clear prompt line so output starts here
-    streamHasSavedPos = true;
+  const cols = process.stdout.columns || 80;
+  hideCursor();
+
+  if (streamPromptDrawn) {
+    // Erase the temp prompt and return to the output position.
+    write("\x1b[A");                               // up from prompt to output line
+    const col = (streamCol % cols) + 1;            // 1-based column
+    write(`\x1b[${col}G`);                         // move to output column
+    write("\x1b[J");                                // clear from here to end of display
+    streamPromptDrawn = false;
+  } else if (!streamStarted) {
+    // First chunk — cursor is on the prompt line. Replace it with output.
+    write("\r\x1b[2K");
+    streamStarted = true;
   }
 
-  write(s);              // write the output chunk
-  write("\x1b7");        // save output cursor position
-  write("\n");           // move below output
-  drawPrompt();          // show prompt — cursor lands here
+  // Write the output chunk and track column position.
+  write(s);
+  for (const ch of s) {
+    if (ch === "\n") {
+      streamCol = 0;
+    } else {
+      streamCol++;
+      if (streamCol >= cols) streamCol = 0; // terminal wraps
+    }
+  }
+
+  // Draw a temporary prompt below the output.
+  write("\n");
+  drawPrompt();
+  streamPromptDrawn = true;
 }
 
 // ── Logo ─────────────────────────────────────────────────────────────
@@ -385,7 +419,8 @@ async function handleInput(userMessage: string): Promise<void> {
 
   isProcessing = false;
   currentAbort = null;
-  write("\n");
+  // Prompt is already visible (from streamEnd or stopSpinner).
+  // Just redraw it in place to pick up any text the user typed.
   drawPrompt();
 }
 
