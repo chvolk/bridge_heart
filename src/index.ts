@@ -173,7 +173,7 @@ function stopSpinner(): void {
 // ── State ────────────────────────────────────────────────────────────
 let isProcessing = false;
 let currentAbort: AbortController | null = null;
-let pendingInterrupt: string | null = null;
+let pendingInput: string | null = null;
 let streamingActive = false;
 let streamCol = 0;            // 0-based column tracker for output cursor
 let streamPromptDrawn = false; // is there a temp prompt line below output?
@@ -303,9 +303,9 @@ rl.on("line", (rawInput: string) => {
   }
 
   if (isProcessing) {
-    pendingInterrupt = input;
-    currentAbort?.abort();
-    write(chalk.dim("  ↩ Added to task — restarting...\n"));
+    // Queue the input for after the current turn finishes.
+    // Don't abort — let the bot finish its response.
+    pendingInput = input;
     drawPrompt();
   } else {
     void handleInput(input);
@@ -401,17 +401,6 @@ async function handleInput(userMessage: string): Promise<void> {
   streamEnd();
   stopSpinner();
 
-  if (signal.aborted && pendingInterrupt) {
-    history.push({ role: "user", content: userMessage });
-    if (partialAssistantText) history.push({ role: "assistant", content: partialAssistantText });
-    const interrupt = pendingInterrupt;
-    pendingInterrupt = null;
-    isProcessing = false;
-    currentAbort = null;
-    await handleInput(interrupt);
-    return;
-  }
-
   if (completedMessage) {
     history.push({ role: "user", content: userMessage });
     if (completedMessage.content) history.push(completedMessage);
@@ -419,9 +408,17 @@ async function handleInput(userMessage: string): Promise<void> {
 
   isProcessing = false;
   currentAbort = null;
-  // Prompt is already visible (from streamEnd or stopSpinner).
-  // Just redraw it in place to pick up any text the user typed.
-  drawPrompt();
+
+  // If the user typed something while the bot was responding, send it now.
+  if (pendingInput) {
+    const next = pendingInput;
+    pendingInput = null;
+    void handleInput(next);
+  } else {
+    // Prompt is already visible (from streamEnd or stopSpinner).
+    // Just redraw it in place to pick up any text the user typed.
+    drawPrompt();
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
