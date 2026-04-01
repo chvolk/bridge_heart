@@ -166,41 +166,48 @@ let isProcessing = false;
 let currentAbort: AbortController | null = null;
 let pendingInterrupt: string | null = null;
 let streamingActive = false;
-// When streaming text, we write directly (no erase/redraw cycle) for
-// smooth character-by-character output. This flag tracks whether the
-// cursor is "in the output area" (above the bottom lines).
-let streamCursorInOutput = false;
+// Tracks whether \x1b7 holds a saved output-cursor position.
+let streamHasSavedPos = false;
 
 // ── Streaming helpers ────────────────────────────────────────────────
 //
-// During text streaming we don't want the erase/redraw overhead on every
-// character. Instead we temporarily remove the bottom lines, stream
-// directly, and put them back when streaming ends or is interrupted.
+// During streaming we keep the prompt visible below the output at all
+// times.  After each chunk we:
+//   1. Save the output cursor position (\x1b7)
+//   2. Draw the prompt on the next line
+// On the next chunk we:
+//   1. Restore to the saved output position (\x1b8)
+//   2. Clear everything below it (\x1b[J) — wipes the temp prompt
+//   3. Write the new chunk, then repeat.
 
 function streamStart(): void {
   streamingActive = true;
-  // Erase bottom lines so we can write output directly.
-  eraseBottom();
-  streamCursorInOutput = true;
+  streamHasSavedPos = false;
 }
 
 function streamEnd(): void {
   if (!streamingActive) return;
   streamingActive = false;
-  if (streamCursorInOutput) {
-    // We were writing directly — put bottom lines back.
-    redrawBottom();
-    streamCursorInOutput = false;
-  }
+  streamHasSavedPos = false;
+  // Prompt is already drawn from the last streamWrite call.
 }
 
-/** Write a chunk during streaming (fast path, no erase/redraw). */
+/** Write a chunk during streaming, keeping the prompt visible below. */
 function streamWrite(s: string): void {
-  if (!streamCursorInOutput) {
-    eraseBottom();
-    streamCursorInOutput = true;
+  if (streamHasSavedPos) {
+    // Return to where we left off in the output.
+    write("\x1b8");      // restore output cursor
+    write("\x1b[J");     // clear from here to end of screen (wipes temp prompt)
+  } else {
+    // First chunk — cursor is on the prompt line.
+    write("\r\x1b[2K");  // clear prompt line so output starts here
+    streamHasSavedPos = true;
   }
-  write(s);
+
+  write(s);              // write the output chunk
+  write("\x1b7");        // save output cursor position
+  write("\n");           // move below output
+  drawPrompt();          // show prompt — cursor lands here
 }
 
 // ── Logo ─────────────────────────────────────────────────────────────
